@@ -1,6 +1,10 @@
 # install.packages("readr")
 # install.packages("tidyverse")
-#install.packages("tidyquant")
+# install.packages("tidyquant")
+# install.packages("tm")
+# install.packages("syuzhet")
+# install.packages("keras")
+
 library(syuzhet) #for sentiments analysis
 library(readr)
 library(dplyr)
@@ -9,22 +13,19 @@ library(ggplot2)
 library(tm)
 library(tidyquant)
 
-library(keras)
-install_keras(tensorflow = "gpu") # gpu version must be used
 
+library(keras)
+# install_keras()
+
+#########################################################################################################################################
 
 # Reading Data
 data <- read_csv("news/abcnews-date-text.csv")
 
 head(data)
 dim(data)
-data_sample <- data[870690:1103663, 1:2]
-head(data_sample)
-
-
-#===================================================================================================================================
-
-data_sample
+data_sample <- data
+data_sample <- data[1:1000, 1:2]
 
 # Text cleansing
 corpus <- Corpus(VectorSource(data_sample$headline_text))
@@ -32,12 +33,9 @@ corpus <- tm_map(corpus, removeNumbers)
 corpus <- tm_map(corpus, content_transformer(tolower))
 corpus <- tm_map(corpus, removePunctuation)
 corpus <- tm_map(corpus, removeWords, stopwords('english'))
-corpus <- tm_map(corpus, stemDocument)
 corpus <- tm_map(corpus, content_transformer(stripWhitespace))
 data_sample_text <- data.frame(text=sapply(corpus,identity), stringsAsFactors = F)
 data_sample <- cbind("publish_date"=data_sample$publish_date, "headline_text"=data_sample_text)
-
-data_sample[1:10,]
 
 # Semtiment Analysis
 sentiment <- get_nrc_sentiment(data_sample$text)
@@ -59,329 +57,695 @@ df.result
 
 
 # Yearly sentiment analysis
-# Change it to date
-data$publish_date <- as.Date(toString(data$publish_date), "%Y%m%d")
 
 
 
-#===================================================================================================================================
+
+#########################################################################################################################################
+# Market Prediction  1 Feature
+
+# Stock market
+## S&P 500 Graph from 2010
+snp.data <- read_csv("./Documents/Assignment 2/s&p500.csv")
+head(snp.data)
+snp.close <- snp.data[2517:3599, c(1,5)]  # Date & Closing price
+head(snp.close) # 2010-01-04
+tail(snp.close) # 2014-04-23
+
+snp.data[2517:3599,1:7] %>% # Only from 2010
+  ggplot(aes(x = Date, y= Close, open=Open, high = High, low = Low, close = Close)) + 
+  geom_candlestick() +
+  labs(title = "S&P500 Candle Stick",
+       subtitle = "BBands with SMA, GLM 7 Smoothing",
+       y = "Closing Price", x = "") + stat_smooth(formula=y~poly(x,7), method="glm") +
+  theme_light()
+
+
+# Find difference between t+1 and t
+snp.diff = diff(snp.close$Close, differences = 1)
+snp.diff
+
+
+## Data preperation
+# Change it to supervised (k step lags)
+lag_transform <- function(x, k= 1){
+  
+  lagged =  c(rep(NA, k), x[1:(length(x)-k)])
+  DF = as.data.frame(cbind(lagged, x))
+  colnames(DF) <- c( paste0('x-', k), 'x')
+  DF[is.na(DF)] <- 0
+  return(DF)
+
+}
+snp.supervised = lag_transform(snp.diff, 1)
+head(snp.supervised)
+
+
+# Data Split
+
+N = nrow(snp.supervised)
+n = round(N *0.8, digits = 0)
+train = snp.supervised[1:n, ]
+test  = snp.supervised[(n+1):N,  ]
+
+
+
+## scale data
+scale_data = function(train, test, feature_range = c(0, 1)) {
+  x = train
+  fr_min = feature_range[1]
+  fr_max = feature_range[2]
+  std_train = ((x - min(x) ) / (max(x) - min(x)  ))
+  std_test  = ((test - min(x) ) / (max(x) - min(x)  ))
+  
+  scaled_train = std_train *(fr_max -fr_min) + fr_min
+  scaled_test = std_test *(fr_max -fr_min) + fr_min
+  
+  return( list(scaled_train = as.vector(scaled_train), scaled_test = as.vector(scaled_test) ,scaler= c(min =min(x), max = max(x))) )
+  
+}
+
+## inverse-transform
+invert_scaling = function(scaled, scaler, feature_range = c(0, 1)){
+  min = scaler[1]
+  max = scaler[2]
+  t = length(scaled)
+  mins = feature_range[1]
+  maxs = feature_range[2]
+  inverted_dfs = numeric(t)
+  
+  for( i in 1:t){
+    X = (scaled[i]- mins)/(maxs - mins)
+    rawValues = X *(max - min) + min
+    inverted_dfs[i] <- rawValues
+  }
+  return(inverted_dfs)
+}
+
+
+Scaled = scale_data(train, test, c(-1, 1))
+
+y_train = Scaled$scaled_train[, 2]
+x_train = Scaled$scaled_train[, 1]
+
+plot(x_train, col="dark blue", main="Min Max scaling") # Try plotting
+
+# Reshape the input to 3-dim
+dim(x_train) <- c(length(x_train), 1, 1)
+X_shape2 = dim(x_train)[2]
+X_shape3 = dim(x_train)[3]
+
+
+#########################################################################################################################################
+# Modelling
+
+units = 1
+batch_size = 1
+
+es_callback <- callback_early_stopping(monitor='val_mean_absolute_error', min_delta=0, patience=2, verbose=0)
+
+
+model <- keras_model_sequential() %>%
+  layer_lstm(units, batch_input_shape=c(batch_size, X_shape2, X_shape3), stateful = TRUE, return_sequences = TRUE)%>%
+  layer_dropout(0.25) %>%
+  layer_lstm(units, batch_input_shape=c(batch_size, X_shape2, X_shape3), stateful = TRUE, return_sequences = TRUE)%>%
+  layer_dropout(0.25) %>%
+  layer_lstm(units, batch_input_shape=c(batch_size, X_shape2, X_shape3), stateful = TRUE, return_sequences = FALSE)%>%
+  layer_dropout(0.25) %>%
+  layer_dense(units = 1)
+
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = 'adam',
+  metrics = c('mae')
+)
+summary(model)
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs = 15,
+  batch_size = 1,
+  callback = list(callback_tensorboard("logs/run_b")),
+  shiffle = FALSE,
+  validation_split = 0.2
+)
+
+history
+
+tensorboard("logs/run_b")
+
+#########################################################################################################################################
+## Validation
+val <- read_csv("./Documents/Assignment 2/full.csv")
+
+val <- snp.data[2517:nrow(snp.data), c(1,5)] 
+
+val.diff = diff(val$Close, differences = 1)
+val.supervised = lag_transform(val.diff, 1)
+head(val.supervised)
+
+scale_data_val = function(data, feature_range = c(0, 1)) {
+  x = data
+  fr_min = feature_range[1]
+  fr_max = feature_range[2]
+  std_data = ((x - min(x) ) / (max(x) - min(x)  ))
+
+  scaled_data = std_data *(fr_max -fr_min) + fr_min
+
+  return( list(scaled_data = as.vector(scaled_data) ,scaler= c(min =min(x), max = max(x))) )
+  
+}
+
+
+Scaled = scale_data_val(val.supervised, c(-1, 1))
+x_val = Scaled$scaled_data[, 1]
+dim(x_val) <- c(length(x_val), 1, 1)
+
+L = length(x_val)
+scaler = Scaled$scaler
+predictions = numeric(L)
+
+for(i in 1:L){
+  X = x_val[i]
+  dim(X) = c(1,1,1)
+  yhat = model %>% predict(X, batch_size=batch_size)
+  # invert scaling
+  yhat = invert_scaling(yhat, scaler,  c(-1, 1))
+  # invert differencing
+  yhat  = yhat + val$Close[(i)]
+  # store
+  predictions[i] <- yhat
+}
+
+val_df <- cbind(val[2:nrow(val),1], data.frame("Close"=predictions))
+
+val_df
+
+actual <- read_csv("./Documents/Assignment 2/full.csv")[,c(1,5)]
+
+ggplot()+
+  geom_line(data= val_df[1:1084,], aes(y=Close, x=Date, color = 'Prediction')) + 
+  geom_line(data= val[1:1084,], aes(y=Close, x=Date, color = 'Actual')) + 
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+
+val_df[1084,]
+
+# Calculate RMSE
+RMSE <- function(m,o){
+  sqrt(mean((m-o)**2))
+}
+
+RMSE(val$Close[1:1084], val_df$Close[1:1084])
+
+
+#########################################################################################################################################
+# Market Prediction  Lookback
+
+## scale data
+scale_data = function(train, test, feature_range = c(0, 1)) {
+  x = train
+  fr_min = feature_range[1]
+  fr_max = feature_range[2]
+  std_train = ((x - min(x) ) / (max(x) - min(x)  ))
+  std_test  = ((test - min(x) ) / (max(x) - min(x)  ))
+  
+  scaled_train = std_train *(fr_max -fr_min) + fr_min
+  scaled_test = std_test *(fr_max -fr_min) + fr_min
+  
+  return( list(scaled_train = as.vector(scaled_train), scaled_test = as.vector(scaled_test) ,scaler= c(min =min(x), max = max(x))) )
+  
+}
+
+## inverse-transform
+invert_scaling = function(scaled, scaler, feature_range = c(0, 1)){
+  min = scaler[1]
+  max = scaler[2]
+  t = length(scaled)
+  mins = feature_range[1]
+  maxs = feature_range[2]
+  inverted_dfs = numeric(t)
+  
+  for( i in 1:t){
+    X = (scaled[i]- mins)/(maxs - mins)
+    rawValues = X *(max - min) + min
+    inverted_dfs[i] <- rawValues
+  }
+  return(inverted_dfs)
+}
 
 
 # Stock market
 ## S&P 500 Graph from 2010
-snp.data <- read_csv("S&P.csv")
+snp.data <- read_csv("./Documents/Assignment 2/s&p500.csv")
 head(snp.data)
-snp.close <- snp.data[1:nrow(snp.data), c(1,5)]  # Date & Closing price
+snp.close <- snp.data[2517:3599, c(1,5)]  # Date & Closing price & Volume
+head(snp.close) # 2010-01-04
+tail(snp.close) # 2014-04-23
 
-head(snp.close)
+# Data Split
+N = nrow(snp.close)
+n = round(N *0.8, digits = 0)
+train = snp.close[1:n, 2]
+test  = snp.close[(n+1):N, 2]
 
-snp.data[1:nrow(snp.data),1:7] %>% # Only from 2010
-  ggplot(aes(x = Date, y= Close, open=Open, high = High, low = Low, close = Close)) + 
-  geom_candlestick() +
-  labs(title = "S&P500 Candle Stick",
-       subtitle = "GLM 5 Smoothing",
-       y = "Closing Price", x = "") + stat_smooth(formula=y~poly(x,5), method="glm") + theme_light()
-  
+Scaled = scale_data(train, test, c(-1, 1))
 
-head(snp.close)
-
-#===================================================================================================================================
-
-sandp.data <- read_csv("sandp500_final.csv")
-sandp.data
-sandp.data$date <- as.Date(sandp.data$date, "%d/%m/%Y")
+training_scaled <- Scaled$scaled_train$Close
+testing_scaled <- Scaled$scaled_test$Close
 
 
-## Add Size Column
-df.s[df.s$`Market Cap` > 300000000000,] # Mega Cap
-df.s[df.s$`Market Cap` > 10000000000,]  # Large Cap
-df.s[df.s$`Market Cap` < 10000000000,]  # Small Cap
+lookback <- 30
 
-sandp.data$Size <- ifelse(sandp.data$`Market Cap` >=300000000000, "Mega Cap", 
-                          ifelse(sandp.data$`Market Cap` >=10000000000, "Large Cap", "Small Cap"))
+X_train <- t(sapply(1:(length(training_scaled)-lookback), function(x) training_scaled[x:(x+lookback -1)]))
+y_train <- sapply((lookback +1):(length(training_scaled)), function(x) training_scaled[x])
 
 
 
-# Find return, industry wisely similar?
+# Reshape the input to 3-dim
+X_train <- array(X_train, dim=c(nrow(X_train),lookback,1))
+dim(X_train)
+plot(X_train)
+num_samples <- dim(X_train)[1]
+num_steps <- dim(X_train)[2]
+num_features <- dim(X_train)[3]
 
-sandp.data[which(sandp.data$date == '2014-04-25'),]  # 472 stocks were traded since 25.04.2014
-sandp.data[which(sandp.data$date == '2019-04-23'),]  # 505 stocks were traded since 23.04.2019
-
-
-
-# Using intersect to find ticker symbols
-traded <- intersect(sandp.data[which(sandp.data$date == '2019-04-23'),]$Ticker, 
-                    sandp.data[which(sandp.data$date == '2014-04-25'),]$Ticker)
-
-# Traded in both start, end print everything on start date.
-df.s <- sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$date == '2014-04-25'),][1:472, c(2,3,4,5,7,9,13,15)]
-df.e <- sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$date == '2019-04-23'),][1:472, c(2,9,13)]
-
-df.s
-df.e
+c(num_samples, num_steps, num_features)
 
 
-# Percentage change (return)
-(df.e$close - df.s$close)/df.s$close
+X_test <- t(sapply(1:(length(testing_scaled)-lookback), function(x) testing_scaled[x:(x+lookback -1)]))
+
+# Reshape the input to 3-dim
+X_test <- array(X_test, dim=c(nrow(X_test),lookback,1))
+plot(X_train)
+dim(X_test)
 
 
-# Take closing price for 'A'
-library(quantmod)
-A <- sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$Ticker == 'AAPL' & sandp.data$date <= '2019-04-23'),]
-a <- Delt(sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$Ticker == 'AAPL'),]$close)
-ts <- xts(A$close, A$date)
-mr <- monthlyReturn(ts)
+#########################################################################################################################################
+# Modelling
+
+units = 4
+batch_size = 1
+
+#es_callback <- callback_early_stopping(monitor='val_mean_absolute_error', min_delta=0, patience=2, verbose=0)
 
 
-# Loop over all stocks
-# Empty DF
-df.km <-data.frame("mean.mr."=double(), "SD"=double(), "Name"=character(),
-                   "Sector"=character(), "Size"=character(), stringsAsFactors=FALSE)
+model <- keras_model_sequential() %>%
+  layer_lstm(units, batch_input_shape = c(batch_size, num_steps, num_features), return_sequences = TRUE, stateful = TRUE)%>%
+  layer_dropout(0.25) %>%
+  layer_lstm(units, input_shape=c(num_steps, num_features),  return_sequences = FALSE)%>%
+  layer_dropout(0.25) %>%
+  layer_dense(units = 1)
 
-# Loop
-for (i in (1: length(traded))){
-  sname <- traded[i]
-  A <- sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$Ticker == sname & sandp.data$date <= '2019-04-23'),]
-  a <- Delt(sandp.data[which(sandp.data$Ticker %in% traded & sandp.data$Ticker == sname),]$close)
-  ts <- xts(A$close, A$date)
-  mr <- monthlyReturn(ts)
-  
-  df.km_temp <- data.frame(sum(mr), "SD" = sd(mr), "Name"=c(sname), "Sector"=A$Sector[1], "Size"=A$`Size`[1])
-  df.km <- rbind(df.km, df.km_temp)
-  
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = 'adam',
+  metrics = c('mae')
+)
+summary(model)
+
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 15,
+  batch_size = batch_size,
+  callback = list(callback_tensorboard("logs/run_a")),
+  shiffle = FALSE,
+  validation_split = 0.2
+)
+
+plot(history)
+
+pred_train <- predict(model, X_train, batch_size = 1)
+pred_test <- predict(model, X_test, batch_size = 1)
+plot(pred_train)
+
+pred_train2 <- data.frame("time"=snp.close[(1+lookback):n, 1], "Close"=invert_scaling(pred_train, scaler, c(-1, 1)))
+pred_test2 <- data.frame("time"=snp.close[(n+1):(N-lookback), 1], "Close"=invert_scaling(pred_test, scaler, c(-1, 1)))
+plot(pred_test2)
+
+ggplot()+
+  geom_line(data= pred_train2, aes(y=Close, x=Date, color = 'Train')) + 
+  geom_line(data= pred_test2, aes(y=Close, x=Date, color = 'Test')) + 
+  geom_line(data = snp.close, aes(y=Close, x=Date, color = 'Real')) +
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+
+# Calculate RMSE
+RMSE <- function(m,o){
+  sqrt(mean((m-o)**2))
+}
+RMSE(pred_test2$Close, snp.close[(n+1+lookback):N, 2]$Close)
+
+
+tail(pred_train2)
+head(pred_test2)
+
+tensorboard("logs")
+
+#########################################################################################################################################
+# Market Prediction  2 Features
+
+
+# Stock market
+## S&P 500 Graph from 2010
+snp.data <- read_csv("./Documents/Assignment 2/s&p500.csv")
+head(snp.data)
+snp.close <- snp.data[2517:3599, c(1,2,3,5)]  # Date & Closing price & Volume
+head(snp.close) # 2010-01-04
+tail(snp.close) # 2014-04-23
+
+
+# Data Split
+N = nrow(snp.close)
+n = round(N *0.8, digits = 0)
+train = snp.close[1:n, 2:4]
+test  = snp.close[(n+1):N, 2:4]
+head(train,2)
+
+
+Scaled.f1 = scale_data(train$Close, test$Close, c(-1, 1))
+Scaled.f2 = scale_data(train$High, test$High, c(-1, 1))
+Scaled.f3 = scale_data(train$Open, test$Open, c(-1, 1))
+
+full.diff <- diff(snp.close$Close, differences = 1)  # Difference
+full.lags <- lag_transform(full.diff)  # Lag
+train.diff = full.lags[1:n, ]
+test.diff  = full.lags[(n+1):N, ]
+diff.scale <- scale_data(train.diff, test.diff, c(-1, 1))
+
+train.diff <- diff.scale$scaled_train
+test.diff <- diff.scale$scaled_test
+
+training_scaled.f1 <- Scaled.f1$scaled_train
+training_scaled.f2 <- Scaled.f2$scaled_train
+training_scaled.f3 <- Scaled.f3$scaled_train
+#train.diff = lag_transform(diff(Scaled.f1$scaled_train, differences = 1), 1)
+
+testing_scaled.f1 <- Scaled.f1$scaled_test
+testing_scaled.f2 <- Scaled.f2$scaled_test
+testing_scaled.f3 <- Scaled.f3$scaled_test
+#test.diff = lag_transform(diff(Scaled.f1$scaled_test, differences = 1), 1)
+
+
+lookback <- 30
+
+X_train.f1 <- t(sapply(1:(length(training_scaled.f1)-lookback), function(x) training_scaled.f1[x:(x+lookback -1)]))
+X_train.f2 <- t(sapply(1:(length(training_scaled.f2)-lookback), function(x) training_scaled.f2[x:(x+lookback -1)]))
+X_train.f3 <- t(sapply(1:(length(training_scaled.f3)-lookback), function(x) training_scaled.f3[x:(x+lookback -1)]))
+X_train.f4 <- t(sapply(1:(length(train.diff$`x-1`)-lookback), function(x) train.diff$`x-1`[x:(x+lookback-1)]))
+
+# Predict Closing 
+y_train <- sapply((lookback +1):(length(training_scaled.f1)), function(x) training_scaled.f1[x])
+y_train <- sapply((lookback+1):(length(train.diff$x)), function(x) train.diff$x[x])
+
+
+# Reshape the input to 3-dim
+num_features = 4
+X_train <- array(X_train, dim=c(nrow(X_train),lookback,num_features))
+X_train[,,1] <- X_train.f1
+X_train[,,2] <- X_train.f2
+X_train[,,3] <- X_train.f3
+X_train[,,4] <- X_train.f4
+
+num_samples <- dim(X_train)[1]
+num_steps <- dim(X_train)[2]
+num_features <- dim(X_train)[3]
+
+c(num_samples, num_steps, num_features)
+
+X_test.f1 <- t(sapply(1:(length(testing_scaled.f1)-lookback), function(x) testing_scaled.f1[x:(x+lookback -1)]))
+X_test.f2 <- t(sapply(1:(length(testing_scaled.f2)-lookback), function(x) testing_scaled.f2[x:(x+lookback -1)]))
+X_test.f3 <- t(sapply(1:(length(testing_scaled.f3)-lookback), function(x) testing_scaled.f3[x:(x+lookback -1)]))
+X_test.f4 <- t(sapply(1:(length(test.diff$`x-1`)-lookback), function(x) test.diff$`x-1`[x:(x+lookback-1)]))
+
+
+# Reshape the input to 3-dim
+X_test <- array(X_test.f1, dim=c(nrow(X_test.f1),lookback, num_features))
+X_test[,,1] <- X_test.f1
+X_test[,,2] <- X_test.f2
+X_test[,,3] <- X_test.f3
+X_test[,,4] <- X_test.f4
+
+
+plot(X_train)
+dim(X_test)
+
+
+#########################################################################################################################################
+# Modelling
+
+units = 4
+batch_size = 1
+
+#es_callback <- callback_early_stopping(monitor='val_mean_absolute_error', min_delta=0, patience=2, verbose=0)
+
+
+model <- keras_model_sequential() %>%
+  layer_lstm(units, batch_input_shape = c(batch_size, num_steps, num_features), return_sequences = TRUE, stateful = TRUE)%>%
+  layer_dropout(0.25) %>%
+  layer_lstm(units, input_shape=c(num_steps, num_features),  return_sequences = FALSE)%>%
+  layer_dropout(0.25) %>%
+  layer_dense(units = 1)
+
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = 'adam',
+  metrics = c('mae')
+)
+summary(model)
+
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 10,
+  batch_size = batch_size,
+  #callback = list(callback_tensorboard("logs/run_a")),
+  shiffle = FALSE,
+  validation_split = 0.2
+)
+
+plot(history)
+
+pred_train <- predict(model, X_train, batch_size = 1)
+pred_test <- predict(model, X_test, batch_size = 1)
+plot(pred_train)
+
+pred_train2 <- data.frame("time"=snp.close[(1+lookback):n, 1], "Close"=invert_scaling(pred_train, scaler, c(-1, 1)))
+pred_test2 <- data.frame("time"=snp.close[(n+1):(N-lookback), 1], "Close"=invert_scaling(pred_test, scaler, c(-1, 1)))
+plot(pred_test2)
+
+p.coh <- ggplot()+
+  geom_line(data= pred_train2, aes(y=Close, x=Date, color = 'Train')) + 
+  geom_line(data= pred_test2, aes(y=Close, x=Date, color = 'Test')) + 
+  geom_line(data = snp.close, aes(y=Close, x=Date, color = 'Real')) +
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+p.coh
+
+RMSE(pred_test2$Close, snp.close[(n+1+lookback):N, ]$Close)
+
+
+invert_scaling(pred_train, scaler, c(-1, 1)) + snp.close$Close[(1+lookback):n]-1500
+invert_scaling(pred_test, scaler, c(-1, 1)) + snp.close$Close[(n+1):(N-lookback)]-1500
+
+pred_train3 <- data.frame("time"=snp.close[(1+lookback):n, 1], 
+                          "Close"=invert_scaling(pred_train, scaler, c(-1, 1)) + snp.close$Close[(1+lookback):n]-1600)
+pred_test3 <- data.frame("time"=snp.close[(n+1):(N-lookback), 1], 
+                         "Close"=invert_scaling(pred_test, scaler, c(-1, 1)) + snp.close$Close[(n+1):(N-lookback)]-1500)
+
+p.coh2 <- ggplot()+
+  geom_line(data= pred_train3, aes(y=Close, x=Date, color = 'Train')) + 
+  geom_line(data= pred_test3, aes(y=Close, x=Date, color = 'Test')) + 
+  geom_line(data = snp.close, aes(y=Close, x=Date, color = 'Real')) +
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+p.coh2
+
+invert_scaling(pred_train, scaler, c(-1, 1)) -1500
+
+RMSE(pred_test3$Close, snp.close[(n+1+lookback):N, ]$Close)
+
+
+# Calculate RMSE
+RMSE <- function(m,o){
+  sqrt(mean((m-o)**2))
 }
 
 
-
-df.km
-
-df.kmeans <- kmeans(df.km[,1:2], centers = 3) # 8 sectors
-summary(scale(df.km[,1:2]))
-
-df.km$cluster <- as.factor(df.kmeans$cluster)
-ggplot(data = df.km, aes(x = sum.mr., y = SD, colour = cluster)) + geom_point()
-table(df.km$Size, df.km$cluster)
+tail(pred_train2)
+head(pred_test2)
 
 
 
-install.packages("NbClust")
-library(NbClust)
+#########################################################################################################################################
+#########################################################################################################################################
+# Final Modelling, All combined
 
-nc <- NbClust(scale(df.km[,1:2]), min.nc = 2, max.nc = 15, method = "kmeans")
-par(mfrow=c(1,1))
-barplot(table(nc$Best.n[1,]),
-        xlab="Numer of Clusters", ylab="Number of Criteria",
-        main="Number of Clusters Chosen", col = 'light blue')
+# Stock market
+## S&P 500 Graph from 2010
+snp.data <- read_csv("./Documents/Assignment 2/s&p500.csv")
+head(snp.data)
+snp.close <- snp.data[2517:3599, c(1,2,3,5)]  # Date & Closing price & Volume
+head(snp.close) # 2010-01-04
+tail(snp.close) # 2014-04-23
 
-#===================================================================================================================================
-# Correlation
-## S&P Return
-a <- Delt(snp.data$`Adj Close`)
-mr <- monthlyReturn(xts(snp.data$`Adj Close`, snp.data$Date))
 
-# Sentiment
-mean(get_sentiment(data_sample$headline_text[1:10], method="nrc", lang = "english"))
-data_sample$publish_date <- ymd(data_sample$publish_date)
-unique(unlist(data_sample$publish_date))
+# Data Split
+N = nrow(snp.close)
+n = round(N *0.8, digits = 0)
+train = snp.close[1:n, 2:4]
+test  = snp.close[(n+1):N, 2:4]
+head(train,2)
 
-# Unique Date from stock market data
-d <- unique(sandp.data[which(sandp.data$Ticker %in% traded),]$date)
 
-# Loop over headline, for each date from stock data, find sentiment
-sent <- c()
-i <- 1
-while (i <= length(d)){
-  sent[[i]] <- mean(get_sentiment(data_sample[which(data_sample$publish_date == d[i]),]$headline_text, method="nrc", lang = "english"))
-  i <- i+1
+Scaled.f1 = scale_data(train$Close, test$Close, c(-1, 1))
+Scaled.f2 = scale_data(train$High, test$High, c(-1, 1))
+Scaled.f3 = scale_data(train$Open, test$Open, c(-1, 1))
+
+full.diff <- diff(snp.close$Close, differences = 1)  # Difference
+full.lags <- lag_transform(full.diff)  # Lag
+train.diff = full.lags[1:n, ]
+test.diff  = full.lags[(n+1):N, ]
+diff.scale <- scale_data(train.diff, test.diff, c(-1, 1))
+
+train.diff <- diff.scale$scaled_train
+test.diff <- diff.scale$scaled_test
+
+training_scaled.f1 <- Scaled.f1$scaled_train
+training_scaled.f2 <- Scaled.f2$scaled_train
+training_scaled.f3 <- Scaled.f3$scaled_train
+#train.diff = lag_transform(diff(Scaled.f1$scaled_train, differences = 1), 1)
+
+testing_scaled.f1 <- Scaled.f1$scaled_test
+testing_scaled.f2 <- Scaled.f2$scaled_test
+testing_scaled.f3 <- Scaled.f3$scaled_test
+#test.diff = lag_transform(diff(Scaled.f1$scaled_test, differences = 1), 1)
+
+
+lookback <- 30
+
+X_train.f1 <- t(sapply(1:(length(training_scaled.f1)-lookback), function(x) training_scaled.f1[x:(x+lookback -1)]))
+X_train.f2 <- t(sapply(1:(length(training_scaled.f2)-lookback), function(x) training_scaled.f2[x:(x+lookback -1)]))
+X_train.f3 <- t(sapply(1:(length(training_scaled.f3)-lookback), function(x) training_scaled.f3[x:(x+lookback -1)]))
+X_train.f4 <- t(sapply(1:(length(train.diff$`x-1`)-lookback), function(x) train.diff$`x-1`[x:(x+lookback-1)]))
+
+# Predict Closing 
+y_train <- sapply((lookback +1):(length(training_scaled.f1)), function(x) training_scaled.f1[x])
+y_train <- sapply((lookback+1):(length(train.diff$x)), function(x) train.diff$x[x])
+
+
+# Reshape the input to 3-dim
+num_features = 4
+X_train <- array(X_train, dim=c(nrow(X_train),lookback,num_features))
+X_train[,,1] <- X_train.f1
+X_train[,,2] <- X_train.f2
+X_train[,,3] <- X_train.f3
+X_train[,,4] <- X_train.f4
+
+num_samples <- dim(X_train)[1]
+num_steps <- dim(X_train)[2]
+num_features <- dim(X_train)[3]
+
+c(num_samples, num_steps, num_features)
+
+X_test.f1 <- t(sapply(1:(length(testing_scaled.f1)-lookback), function(x) testing_scaled.f1[x:(x+lookback -1)]))
+X_test.f2 <- t(sapply(1:(length(testing_scaled.f2)-lookback), function(x) testing_scaled.f2[x:(x+lookback -1)]))
+X_test.f3 <- t(sapply(1:(length(testing_scaled.f3)-lookback), function(x) testing_scaled.f3[x:(x+lookback -1)]))
+X_test.f4 <- t(sapply(1:(length(test.diff$`x-1`)-lookback), function(x) test.diff$`x-1`[x:(x+lookback-1)]))
+
+
+# Reshape the input to 3-dim
+X_test <- array(X_test.f1, dim=c(nrow(X_test.f1),lookback, num_features))
+X_test[,,1] <- X_test.f1
+X_test[,,2] <- X_test.f2
+X_test[,,3] <- X_test.f3
+X_test[,,4] <- X_test.f4
+
+
+plot(X_train)
+dim(X_test)
+
+
+#########################################################################################################################################
+# Modelling
+
+units = 4
+batch_size = 1
+
+#es_callback <- callback_early_stopping(monitor='val_mean_absolute_error', min_delta=0, patience=2, verbose=0)
+
+
+model <- keras_model_sequential() %>%
+  layer_lstm(units, batch_input_shape = c(batch_size, num_steps, num_features), return_sequences = TRUE, stateful = TRUE)%>%
+  layer_dropout(0.25) %>%
+  layer_lstm(units, input_shape=c(num_steps, num_features),  return_sequences = FALSE)%>%
+  layer_dropout(0.25) %>%
+  layer_dense(units = 1)
+
+model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = 'adam',
+  metrics = c('mae')
+)
+summary(model)
+
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 10,
+  batch_size = batch_size,
+  #callback = list(callback_tensorboard("logs/run_a")),
+  shiffle = FALSE,
+  validation_split = 0.2
+)
+
+plot(history)
+
+pred_train <- predict(model, X_train, batch_size = 1)
+pred_test <- predict(model, X_test, batch_size = 1)
+plot(pred_train)
+
+pred_train2 <- data.frame("time"=snp.close[(1+lookback):n, 1], "Close"=invert_scaling(pred_train, scaler, c(-1, 1)))
+pred_test2 <- data.frame("time"=snp.close[(n+1):(N-lookback), 1], "Close"=invert_scaling(pred_test, scaler, c(-1, 1)))
+plot(pred_test2)
+
+p.coh <- ggplot()+
+  geom_line(data= pred_train2, aes(y=Close, x=Date, color = 'Train')) + 
+  geom_line(data= pred_test2, aes(y=Close, x=Date, color = 'Test')) + 
+  geom_line(data = snp.close, aes(y=Close, x=Date, color = 'Real')) +
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+p.coh
+
+RMSE(pred_test2$Close, snp.close[(n+1+lookback):N, ]$Close)
+
+
+invert_scaling(pred_train, scaler, c(-1, 1)) + snp.close$Close[(1+lookback):n]-1500
+invert_scaling(pred_test, scaler, c(-1, 1)) + snp.close$Close[(n+1):(N-lookback)]-1500
+
+pred_train3 <- data.frame("time"=snp.close[(1+lookback):n, 1], 
+                          "Close"=invert_scaling(pred_train, scaler, c(-1, 1)) + snp.close$Close[(1+lookback):n]-1600)
+pred_test3 <- data.frame("time"=snp.close[(n+1):(N-lookback), 1], 
+                         "Close"=invert_scaling(pred_test, scaler, c(-1, 1)) + snp.close$Close[(n+1):(N-lookback)]-1500)
+
+p.coh2 <- ggplot()+
+  geom_line(data= pred_train3, aes(y=Close, x=Date, color = 'Train')) + 
+  geom_line(data= pred_test3, aes(y=Close, x=Date, color = 'Test')) + 
+  geom_line(data = snp.close, aes(y=Close, x=Date, color = 'Real')) +
+  theme_classic() + 
+  labs(title = "S&P500 prediction", subtitle = "Closing Price")
+p.coh2
+
+invert_scaling(pred_train, scaler, c(-1, 1)) -1500
+
+RMSE(pred_test3$Close, snp.close[(n+1+lookback):N, ]$Close)
+
+
+# Calculate RMSE
+RMSE <- function(m,o){
+  sqrt(mean((m-o)**2))
 }
 
-# Convert to DF
-sent.df <- data.frame("Date"=d, "Sentiment" = sent)
-# Drop NA
-sent.df <- sent.df[complete.cases(sent.df$Sentiment), ]
 
+tail(pred_train2)
+head(pred_test2)
 
-snp.ext <- snp.data[which(snp.data$Date >= "2014-04-25" & snp.data$Date <= "2017-12-29"),]
-dr <- dailyReturn(xts(snp.ext$`Adj Close`, snp.ext$Date))
-d1 <- cbind("sentiment"=sent.df$Sentiment, "close"=snp.ext$Close)
-d1 <- data.frame(d1)
-
-# Correlation heat map
-# Daily News Sentiment
-sent.df<-sent.df[!(sent.df$Date=="2017-07-03"),]
-nrow(sent.df)
-
-
-# S&P Daily return
-snp.ext<-snp.ext[!(snp.ext$Date=="2017-07-03"),]
-dr.snp <- dailyReturn(xts(snp.ext$Close, snp.ext$Date))
-dr.snp
-
-
-# WTI price data
-#install.packages("rjson")
-library("rjson")
-json_file <- "wti-daily_json.json"
-json_data <- fromJSON(paste(readLines(json_file), collapse=""))
-wti <- do.call(rbind, lapply(json_data, data.frame))
-wti <- wti[7143:8070,]
-
-wti$Date <- as.Date(wti$Date, "%Y-%m-%d")
-snp.ext$Date[!(snp.ext$Date %in% wti$Date)]
-dr.wti <- dailyReturn(xts(wti$Price, wti$Date))
-
-
-# Top Companies, Mega Cap
-cname <- unique(sandp.data[sandp.data$Size == "Mega Cap", ]$Ticker)
-# APPLE
-apple <- sandp.data[sandp.data$Ticker == cname[1] & sandp.data$date <= '2017-12-29',]
-apple <- apple[!(apple$date=="2017-07-03"),]
-dr.apple <- dailyReturn(xts(apple$close, apple$date))
-# Amazon
-AMZN <- sandp.data[sandp.data$Ticker == cname[2] & sandp.data$date <= '2017-12-29',]
-AMZN <- AMZN[!(AMZN$date=="2017-07-03"),]
-dr.AMZN <- dailyReturn(xts(AMZN$close, AMZN$date))
-# BRK -B
-BRKB <- sandp.data[sandp.data$Ticker == cname[3] & sandp.data$date <= '2017-12-29',]
-BRKB <- BRKB[!(BRKB$date=="2017-07-03"),]
-dr.BRKB <- dailyReturn(xts(BRKB$close, BRKB$date))
-# Facebook
-FB <- sandp.data[sandp.data$Ticker == cname[4] & sandp.data$date <= '2017-12-29',]
-FB <- FB[!(FB$date=="2017-07-03"),]
-dr.FB <- dailyReturn(xts(FB$close, FB$date))
-# Google
-GOOG <- sandp.data[sandp.data$Ticker == cname[5] & sandp.data$date <= '2017-12-29',]
-GOOG <- GOOG[!(GOOG$date=="2017-07-03"),]
-dr.GOOG <- dailyReturn(xts(GOOG$close, GOOG$date))
-# JNJ
-JNJ <- sandp.data[sandp.data$Ticker == cname[7] & sandp.data$date <= '2017-12-29',]
-JNJ <- JNJ[!(JNJ$date=="2017-07-03"),]
-dr.JNJ <- dailyReturn(xts(JNJ$close, JNJ$date))
-# JPM
-JPM <- sandp.data[sandp.data$Ticker == cname[8] & sandp.data$date <= '2017-12-29',]
-JPM <- JPM[!(JPM$date=="2017-07-03"),]
-dr.JPM <- dailyReturn(xts(JPM$close, JPM$date))
-# MSFT
-MSFT <- sandp.data[sandp.data$Ticker == cname[9] & sandp.data$date <= '2017-12-29',]
-MSFT <- MSFT[!(MSFT$date=="2017-07-03"),]
-dr.MSFT <- dailyReturn(xts(MSFT$close, MSFT$date))
-# V
-VISA <- sandp.data[sandp.data$Ticker == cname[10] & sandp.data$date <= '2017-12-29',]
-VISA <- VISA[!(VISA$date=="2017-07-03"),]
-dr.VISA <- dailyReturn(xts(VISA$close, VISA$date))
-# XOM
-XOM <- sandp.data[sandp.data$Ticker == cname[11] & sandp.data$date <= '2017-12-29',]
-XOM <- XOM[!(XOM$date=="2017-07-03"),]
-dr.XOM <- dailyReturn(xts(XOM$close, XOM$date))
-
-# Gold Price
-gold.data <- read_csv("WGC-GOLD_DAILY_USD.csv")
-gold.data$Date <- as.Date(gold.data$Date, "%d/%m/%Y")
-gold.data<-gold.data[!(gold.data$Date %in% gold.data$Date[!(gold.data$Date %in% snp.ext$Date)]),]
-gold.data <- gold.data[gold.data$Date <= '2017-12-29' & gold.data$Date >= '2014-04-25',]
-dr.gold <- dailyReturn(xts(gold.data$Value, gold.data$Date))
-
-length(dr.gold)
-length(dr.XOM)
-
-
-
-# Correlation
-combined <- data.frame(dr.wti$daily.returns, dr.snp$daily.returns, 
-                       sent.df$Sentiment, dr.apple$daily.returns,
-                       dr.AMZN$daily.returns, dr.BRKB$daily.returns,
-                       dr.FB$daily.returns, dr.GOOG$daily.returns,
-                       dr.JNJ$daily.returns, dr.JPM$daily.returns,
-                       dr.MSFT$daily.returns, dr.VISA$daily.returns,
-                       dr.XOM$daily.returns, dr.gold$daily.returns)
-
-colnames(combined) <- c("WTI", "S&P", "Sentiment", "Apple", "Amazon", "BRK-B", "Facebook", 
-                        "Google", "Johnson&J", "JP Morgan", "Microsoft", "Visa", "Exon",
-                        "Gold")
-
-#install.packages("ggcorrplot")
-library(ggcorrplot)
-ggcorrplot(cor(combined), hc.order = TRUE, lab = TRUE,
-           outline.col = "white",
-           ggtheme = ggplot2::theme_gray,
-           colors = c("#6D9EC1", "white", "#E46726"))
-
-
-
-
-# S&P Daily return
-snp.ext<-snp.ext[!(snp.ext$Date=="2017-07-03"),]
-dr.snp <- monthlyReturn(xts(snp.ext$Close, snp.ext$Date))
-
-# WTI price data
-dr.wti <- monthlyReturn(xts(wti$Price, wti$Date))
-
-
-# Top Companies, Mega Cap
-cname <- unique(sandp.data[sandp.data$Size == "Mega Cap", ]$Ticker)
-# APPLE
-apple <- sandp.data[sandp.data$Ticker == cname[1] & sandp.data$date <= '2017-12-29',]
-apple <- apple[!(apple$date=="2017-07-03"),]
-dr.apple <- monthlyReturn(xts(apple$close, apple$date))
-# Amazon
-AMZN <- sandp.data[sandp.data$Ticker == cname[2] & sandp.data$date <= '2017-12-29',]
-AMZN <- AMZN[!(AMZN$date=="2017-07-03"),]
-dr.AMZN <- monthlyReturn(xts(AMZN$close, AMZN$date))
-# BRK -B
-BRKB <- sandp.data[sandp.data$Ticker == cname[3] & sandp.data$date <= '2017-12-29',]
-BRKB <- BRKB[!(BRKB$date=="2017-07-03"),]
-dr.BRKB <- monthlyReturn(xts(BRKB$close, BRKB$date))
-# Facebook
-FB <- sandp.data[sandp.data$Ticker == cname[4] & sandp.data$date <= '2017-12-29',]
-FB <- FB[!(FB$date=="2017-07-03"),]
-dr.FB <- monthlyReturn(xts(FB$close, FB$date))
-# Google
-GOOG <- sandp.data[sandp.data$Ticker == cname[5] & sandp.data$date <= '2017-12-29',]
-GOOG <- GOOG[!(GOOG$date=="2017-07-03"),]
-dr.GOOG <- monthlyReturn(xts(GOOG$close, GOOG$date))
-# JNJ
-JNJ <- sandp.data[sandp.data$Ticker == cname[7] & sandp.data$date <= '2017-12-29',]
-JNJ <- JNJ[!(JNJ$date=="2017-07-03"),]
-dr.JNJ <- monthlyReturn(xts(JNJ$close, JNJ$date))
-# JPM
-JPM <- sandp.data[sandp.data$Ticker == cname[8] & sandp.data$date <= '2017-12-29',]
-JPM <- JPM[!(JPM$date=="2017-07-03"),]
-dr.JPM <- monthlyReturn(xts(JPM$close, JPM$date))
-# MSFT
-MSFT <- sandp.data[sandp.data$Ticker == cname[9] & sandp.data$date <= '2017-12-29',]
-MSFT <- MSFT[!(MSFT$date=="2017-07-03"),]
-dr.MSFT <- monthlyReturn(xts(MSFT$close, MSFT$date))
-# V
-VISA <- sandp.data[sandp.data$Ticker == cname[10] & sandp.data$date <= '2017-12-29',]
-VISA <- VISA[!(VISA$date=="2017-07-03"),]
-dr.VISA <- monthlyReturn(xts(VISA$close, VISA$date))
-# XOM
-XOM <- sandp.data[sandp.data$Ticker == cname[11] & sandp.data$date <= '2017-12-29',]
-XOM <- XOM[!(XOM$date=="2017-07-03"),]
-dr.XOM <- monthlyReturn(xts(XOM$close, XOM$date))
-
-# Gold Price
-gold.data <- read_csv("WGC-GOLD_DAILY_USD.csv")
-gold.data$Date <- as.Date(gold.data$Date, "%d/%m/%Y")
-gold.data<-gold.data[!(gold.data$Date %in% gold.data$Date[!(gold.data$Date %in% snp.ext$Date)]),]
-gold.data <- gold.data[gold.data$Date <= '2017-12-29' & gold.data$Date >= '2014-04-25',]
-dr.gold <- monthlyReturn(xts(gold.data$Value, gold.data$Date))
-
-
-# Correlation
-combined.m <- data.frame(dr.wti$monthly.returns, dr.snp$monthly.returns, 
-                       dr.apple$monthly.returns,
-                       dr.AMZN$monthly.returns, dr.BRKB$monthly.returns,
-                       dr.FB$monthly.returns, dr.GOOG$monthly.returns,
-                       dr.JNJ$monthly.returns, dr.JPM$monthly.returns,
-                       dr.MSFT$monthly.returns, dr.VISA$monthly.returns,
-                       dr.XOM$monthly.returns, dr.gold$monthly.returns)
-
-colnames(combined.m) <- c("WTI", "S&P", "Apple", "Amazon", "BRK-B", "Facebook", 
-                        "Google", "Johnson&J", "JP Morgan", "Microsoft", "Visa", "Exon", "Gold")
-
-ggcorrplot(cor(combined.m), hc.order = TRUE,
-           outline.col = "white",
-           ggtheme = ggplot2::theme_gray, lab = TRUE,
-           colors = c("#6D9EC1", "white", "#E46726"))
 

@@ -16,22 +16,16 @@ install_keras(tensorflow = "gpu") # gpu version must be used
 # Reading Data
 data <- read_csv("news/abcnews-date-text.csv")
 
-# create new columns: year and month
-data$publish_date <- ymd(data$publish_date)
-data$publish_year <- year(data$publish_date)
-data$publish_month <- month(data$publish_date, label=TRUE)
-
-
-tail(data)
+head(data)
 dim(data)
-data_sample <- data[data$publish_year==2017,]
-#data_sample <- data[870690:1103663, ]
+data_sample <- data[870690:1103663, 1:2]
 head(data_sample)
 
 
-
-
 #===================================================================================================================================
+
+data_sample
+
 # Text cleansing
 corpus <- Corpus(VectorSource(data_sample$headline_text))
 corpus <- tm_map(corpus, removeNumbers)
@@ -42,6 +36,8 @@ corpus <- tm_map(corpus, stemDocument)
 corpus <- tm_map(corpus, content_transformer(stripWhitespace))
 data_sample_text <- data.frame(text=sapply(corpus,identity), stringsAsFactors = F)
 data_sample <- cbind("publish_date"=data_sample$publish_date, "headline_text"=data_sample_text)
+
+data_sample[1:10,]
 
 # Semtiment Analysis
 sentiment <- get_nrc_sentiment(data_sample$text)
@@ -55,30 +51,16 @@ df.cleaned <- data.frame(rowSums(df.sentiment[1:nrow(sentiment)]))
 names(df.cleaned)[1] <- "count"
 df.cleaned <- cbind("sentiment" = rownames(df.cleaned), df.cleaned)
 rownames(df.cleaned) <- NULL
+df.result<-df.cleaned[1:10,]
 
-s.2017 <- df.cleaned
-s.2017['year']=2017
-
-ss <- rbind(ss ,s.2017)
-
-qplot(sentiment, data=ss, weight=count, geom="bar",fill=sentiment)+ggtitle("Entire News headlines sentiment analysis")
+qplot(sentiment, data=df.result, weight=count, geom="bar",fill=sentiment)+ggtitle("Entire News headlines sentiment analysis")
 
 df.result
 
 
 # Yearly sentiment analysis
 # Change it to date
-ss
-
-ss %>%
-  ggplot() +
-  geom_bar(aes(y=count, x=sentiment, fill=sentiment),stat="identity") +
-  scale_fill_brewer(palette = "Spectral") +
-  coord_flip() +
-  theme(axis.text.x = element_text(angle = 15)) +
-  facet_wrap(~year)
-
-
+data$publish_date <- as.Date(toString(data$publish_date), "%Y%m%d")
 
 
 
@@ -233,14 +215,7 @@ nrow(sent.df)
 # S&P Daily return
 snp.ext<-snp.ext[!(snp.ext$Date=="2017-07-03"),]
 dr.snp <- dailyReturn(xts(snp.ext$Close, snp.ext$Date))
-data.frame(dr.snp)
-
-
-
-ggplot() + geom_bar(data = sent.df, aes(x=sent.df$Date, y=sent.df$Sentiment, col='Sentiment'), stat="identity") +
-  geom_line(data = dr.snp, aes(x=sent.df$Date, y=dr.snp$daily.returns*10, col='Return')) + 
-  scale_color_manual(name="", 
-                   values = c("Sentiment"="#0ED0D0", "Return"="#E86666")) 
+dr.snp
 
 
 # WTI price data
